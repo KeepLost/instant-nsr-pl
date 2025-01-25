@@ -11,13 +11,13 @@ from models.utils import scale_anything, get_activation, cleanup, chunk_batch
 from models.network_utils import get_encoding, get_mlp, get_encoding_with_network
 from utils.misc import get_rank
 from systems.utils import update_module_step
-from nerfacc import ContractionType
+# from nerfacc import ContractionType
 
 
 def contract_to_unisphere(x, radius, contraction_type):
-    if contraction_type == ContractionType.AABB:
+    if contraction_type == 'AABB':
         x = scale_anything(x, (-radius, radius), (0, 1))
-    elif contraction_type == ContractionType.UN_BOUNDED_SPHERE:
+    elif contraction_type == 'UN_BOUNDED_SPHERE':
         x = scale_anything(x, (-radius, radius), (0, 1))
         x = x * 2 - 1  # aabb is at [-1, 1]
         mag = x.norm(dim=-1, keepdim=True)

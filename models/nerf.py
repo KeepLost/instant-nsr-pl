@@ -6,9 +6,9 @@ import torch.nn.functional as F
 
 import models
 from models.base import BaseModel
-from models.utils import chunk_batch
+from models.utils import chunk_batch,validate_empty_rays
 from systems.utils import update_module_step
-from nerfacc import ContractionType, OccupancyGrid, ray_marching, render_weight_from_density, accumulate_along_rays
+from nerfacc import render_weight_from_density, accumulate_along_rays, OccGridEstimator,ray_aabb_intersect
 
 
 @models.register('nerf')
@@ -20,25 +20,27 @@ class NeRFModel(BaseModel):
 
         if self.config.learned_background:
             self.occupancy_grid_res = 256
-            self.near_plane, self.far_plane = 0.2, 1e4
+            self.near_plane, self.far_plane = 0.0, 1e10
             self.cone_angle = 10**(math.log10(self.far_plane) / self.config.num_samples_per_ray) - 1. # approximate
             self.render_step_size = 0.01 # render_step_size = max(distance_to_camera * self.cone_angle, self.render_step_size)
-            self.contraction_type = ContractionType.UN_BOUNDED_SPHERE
+            self.contraction_type = 'UN_BOUNDED_SPHERE'
         else:
             self.occupancy_grid_res = 128
-            self.near_plane, self.far_plane = None, None
+            self.near_plane, self.far_plane = 0.0, 10.0*self.config.radius
             self.cone_angle = 0.0
             self.render_step_size = 1.732 * 2 * self.config.radius / self.config.num_samples_per_ray
-            self.contraction_type = ContractionType.AABB
+            self.contraction_type = 'AABB'
 
         self.geometry.contraction_type = self.contraction_type
 
-        if self.config.grid_prune:
-            self.occupancy_grid = OccupancyGrid(
-                roi_aabb=self.scene_aabb,
-                resolution=self.occupancy_grid_res,
-                contraction_type=self.contraction_type
-            )
+        self.estimator=OccGridEstimator(
+            roi_aabb=self.scene_aabb,
+            resolution=self.occupancy_grid_res,
+            levels=1
+        )
+        if not self.config.grid_prune:
+            self.estimator.occs.fill_(True)
+            self.estimator.binaries.fill_(True)
         self.randomized = self.config.randomized
         self.background_color = None
     
@@ -52,7 +54,7 @@ class NeRFModel(BaseModel):
             return density[...,None] * self.render_step_size
         
         if self.training and self.config.grid_prune:
-            self.occupancy_grid.every_n_step(step=global_step, occ_eval_fn=occ_eval_fn)
+            self.estimator.update_every_n_steps(step=global_step,occ_eval_fn=occ_eval_fn)
 
     def isosurface(self):
         mesh = self.geometry.isosurface()
@@ -66,46 +68,63 @@ class NeRFModel(BaseModel):
             ray_indices = ray_indices.long()
             t_origins = rays_o[ray_indices]
             t_dirs = rays_d[ray_indices]
-            positions = t_origins + t_dirs * (t_starts + t_ends) / 2.
+            positions = t_origins + t_dirs * (t_starts+ t_ends)[..., None] / 2.
             density, _ = self.geometry(positions)
-            return density[...,None]
+            return density.view(-1)
         
         def rgb_sigma_fn(t_starts, t_ends, ray_indices):
             ray_indices = ray_indices.long()
             t_origins = rays_o[ray_indices]
             t_dirs = rays_d[ray_indices]
-            positions = t_origins + t_dirs * (t_starts + t_ends) / 2.
+            positions = t_origins + t_dirs * (t_starts+ t_ends)[..., None] / 2.
             density, feature = self.geometry(positions) 
             rgb = self.texture(feature, t_dirs)
             return rgb, density[...,None]
-
+        
+        t_min, t_max = None, None
+        if not self.config.learned_background:
+            t_min, t_max, hits = ray_aabb_intersect(
+                rays_o=rays_o,
+                rays_d=rays_d,
+                aabbs=self.scene_aabb.unsqueeze(0),
+                near_plane=self.near_plane,
+                far_plane=self.far_plane,
+            )
+            t_min, t_max = t_min.squeeze(), t_max.squeeze()
+        
         with torch.no_grad():
-            ray_indices, t_starts, t_ends = ray_marching(
+            ray_indices, t_starts, t_ends = self.estimator.sampling(
                 rays_o, rays_d,
-                scene_aabb=None if self.config.learned_background else self.scene_aabb,
-                grid=self.occupancy_grid if self.config.grid_prune else None,
-                sigma_fn=sigma_fn,
-                near_plane=self.near_plane, far_plane=self.far_plane,
+                sigma_fn=sigma_fn if self.config.grid_prune else None,
+                near_plane=self.near_plane,
+                far_plane=self.far_plane,
+                t_min=t_min,
+                t_max=t_max,
                 render_step_size=self.render_step_size,
                 stratified=self.randomized,
                 cone_angle=self.cone_angle,
                 alpha_thre=0.0
-            )   
-        
-        ray_indices = ray_indices.long()
+            )
+        ray_indices = ray_indices.flatten().long()
+        ray_indices, t_starts, t_ends=validate_empty_rays(ray_indices,t_starts,t_ends)
+        t_starts = t_starts.flatten()[..., None]
+        t_ends = t_ends.flatten()[..., None]
         t_origins = rays_o[ray_indices]
         t_dirs = rays_d[ray_indices]
         midpoints = (t_starts + t_ends) / 2.
         positions = t_origins + t_dirs * midpoints  
         intervals = t_ends - t_starts
 
-        density, feature = self.geometry(positions) 
+        density, feature = self.geometry(positions)
         rgb = self.texture(feature, t_dirs)
-
-        weights = render_weight_from_density(t_starts, t_ends, density[...,None], ray_indices=ray_indices, n_rays=n_rays)
-        opacity = accumulate_along_rays(weights, ray_indices, values=None, n_rays=n_rays)
-        depth = accumulate_along_rays(weights, ray_indices, values=midpoints, n_rays=n_rays)
-        comp_rgb = accumulate_along_rays(weights, ray_indices, values=rgb, n_rays=n_rays)
+        weights, trans_, _  = render_weight_from_density(
+            t_starts[..., 0], t_ends[..., 0], 
+            density.view(-1), 
+            ray_indices=ray_indices, 
+            n_rays=n_rays)
+        opacity = accumulate_along_rays(weights, values=None, ray_indices=ray_indices, n_rays=n_rays)
+        depth = accumulate_along_rays(weights, values=midpoints, ray_indices=ray_indices, n_rays=n_rays)
+        comp_rgb = accumulate_along_rays(weights, values=rgb, ray_indices=ray_indices, n_rays=n_rays)
         comp_rgb = comp_rgb + self.background_color * (1.0 - opacity)       
 
         out = {

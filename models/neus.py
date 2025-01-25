@@ -6,11 +6,15 @@ import torch.nn.functional as F
 
 import models
 from models.base import BaseModel
-from models.utils import chunk_batch
+from models.utils import chunk_batch,validate_empty_rays
 from systems.utils import update_module_step
-from nerfacc import ContractionType, OccupancyGrid, ray_marching, render_weight_from_density, render_weight_from_alpha, accumulate_along_rays
-from nerfacc.intersection import ray_aabb_intersect
+from nerfacc import render_weight_from_density, render_weight_from_alpha, accumulate_along_rays, OccGridEstimator, ray_aabb_intersect
 
+from pytorch_lightning.utilities.rank_zero import rank_zero_only
+
+@rank_zero_only
+def rank_zero_print(print_str):
+    print(print_str)
 
 class VarianceNetwork(nn.Module):
     def __init__(self, config):
@@ -48,31 +52,41 @@ class NeuSModel(BaseModel):
     def setup(self):
         self.geometry = models.make(self.config.geometry.name, self.config.geometry)
         self.texture = models.make(self.config.texture.name, self.config.texture)
-        self.geometry.contraction_type = ContractionType.AABB
-
+        self.geometry.contraction_type = 'AABB'
+        self.near_plane, self.far_plane = 0.0, 10.0*self.config.radius
+        self.prune_alpha=self.config.get("prune_alpha",False)
+        self.prune_alpha_threshold=self.config.get('prune_alpha_threshold',0.01)
+        
         if self.config.learned_background:
             self.geometry_bg = models.make(self.config.geometry_bg.name, self.config.geometry_bg)
             self.texture_bg = models.make(self.config.texture_bg.name, self.config.texture_bg)
-            self.geometry_bg.contraction_type = ContractionType.UN_BOUNDED_SPHERE
-            self.near_plane_bg, self.far_plane_bg = 0.1, 1e3
+            self.geometry_bg.contraction_type = 'UN_BOUNDED_SPHERE'
+            self.near_plane_bg, self.far_plane_bg = 0.0, 1e10
             self.cone_angle_bg = 10**(math.log10(self.far_plane_bg) / self.config.num_samples_per_ray_bg) - 1.
             self.render_step_size_bg = 0.01            
 
         self.variance = VarianceNetwork(self.config.variance)
         self.register_buffer('scene_aabb', torch.as_tensor([-self.config.radius, -self.config.radius, -self.config.radius, self.config.radius, self.config.radius, self.config.radius], dtype=torch.float32))
-        if self.config.grid_prune:
-            self.occupancy_grid = OccupancyGrid(
+        # if self.config.grid_prune:
+        self.occupancy_grid = OccGridEstimator(
+            roi_aabb=self.scene_aabb,
+            resolution=128,
+            levels=1
+        )
+        if not self.config.grid_prune:
+            self.occupancy_grid.occs.fill_(True)
+            self.occupancy_grid.binaries.fill_(True)
+        if self.config.learned_background:
+            self.occupancy_grid_bg = OccGridEstimator(
                 roi_aabb=self.scene_aabb,
-                resolution=128,
-                contraction_type=ContractionType.AABB
+                resolution=256,
+                levels=1
             )
-            if self.config.learned_background:
-                self.occupancy_grid_bg = OccupancyGrid(
-                    roi_aabb=self.scene_aabb,
-                    resolution=256,
-                    contraction_type=ContractionType.UN_BOUNDED_SPHERE
-                )
+            if not self.config.grid_prune:
+                self.occupancy_grid_bg.occs.fill_(True)
+                self.occupancy_grid_bg.binaries.fill_(True)
         self.randomized = self.config.randomized
+        self.randomized_fg = self.config.get('randomized_fg',False)
         self.background_color = None
         self.render_step_size = 1.732 * 2 * self.config.radius / self.config.num_samples_per_ray
     
@@ -106,9 +120,9 @@ class NeuSModel(BaseModel):
             return density[...,None] * self.render_step_size_bg
         
         if self.training and self.config.grid_prune:
-            self.occupancy_grid.every_n_step(step=global_step, occ_eval_fn=occ_eval_fn, occ_thre=self.config.get('grid_prune_occ_thre', 0.01))
+            self.occupancy_grid.update_every_n_steps(step=global_step, occ_eval_fn=occ_eval_fn, occ_thre=self.config.get('grid_prune_occ_thre', 0.01))
             if self.config.learned_background:
-                self.occupancy_grid_bg.every_n_step(step=global_step, occ_eval_fn=occ_eval_fn_bg, occ_thre=self.config.get('grid_prune_occ_thre_bg', 0.01))
+                self.occupancy_grid_bg.update_every_n_steps(step=global_step, occ_eval_fn=occ_eval_fn_bg, occ_thre=self.config.get('grid_prune_occ_thre_bg', 0.01))
 
     def isosurface(self):
         mesh = self.geometry.isosurface()
@@ -146,42 +160,62 @@ class NeuSModel(BaseModel):
             ray_indices = ray_indices.long()
             t_origins = rays_o[ray_indices]
             t_dirs = rays_d[ray_indices]
-            positions = t_origins + t_dirs * (t_starts + t_ends) / 2.
+            positions = t_origins + t_dirs * (t_starts + t_ends)[..., None] / 2.
             density, _ = self.geometry_bg(positions)
-            return density[...,None]            
+            return density.view(-1)
 
-        _, t_max = ray_aabb_intersect(rays_o, rays_d, self.scene_aabb)
         # if the ray intersects with the bounding box, start from the farther intersection point
         # otherwise start from self.far_plane_bg
         # note that in nerfacc t_max is set to 1e10 if there is no intersection
-        near_plane = torch.where(t_max > 1e9, self.near_plane_bg, t_max)
+        # near_plane_bg = torch.where(t_max > 1e9, self.near_plane_bg, t_max)
+        _, t_max, hits = ray_aabb_intersect(
+            rays_o=rays_o,
+            rays_d=rays_d,
+            aabbs=self.scene_aabb.unsqueeze(0),
+            near_plane=self.near_plane_bg,
+            far_plane=self.far_plane_bg,
+        )
+        t_max, hits = t_max.squeeze(), hits.squeeze()
+        t_max = torch.where(hits,t_max,0.0)
         with torch.no_grad():
-            ray_indices, t_starts, t_ends = ray_marching(
+            ray_indices, t_starts, t_ends = self.occupancy_grid_bg.sampling(
                 rays_o, rays_d,
-                scene_aabb=None,
-                grid=self.occupancy_grid_bg if self.config.grid_prune else None,
                 sigma_fn=sigma_fn,
-                near_plane=near_plane, far_plane=self.far_plane_bg,
+                near_plane=self.near_plane_bg,
+                far_plane=self.far_plane_bg,
+                t_min=t_max,
                 render_step_size=self.render_step_size_bg,
                 stratified=self.randomized,
                 cone_angle=self.cone_angle_bg,
                 alpha_thre=0.0
-            )       
+            )
         
-        ray_indices = ray_indices.long()
+        ray_indices = ray_indices.flatten().long()
+        ray_indices, t_starts, t_ends=validate_empty_rays(ray_indices,t_starts,t_ends)
+        t_starts = t_starts.flatten()[..., None]
+        t_ends = t_ends.flatten()[..., None]
         t_origins = rays_o[ray_indices]
         t_dirs = rays_d[ray_indices]
         midpoints = (t_starts + t_ends) / 2.
-        positions = t_origins + t_dirs * midpoints  
+        # mask=(midpoints.flatten()<t_min[ray_indices]) | (midpoints.flatten()>t_max[ray_indices])
+        # rank_zero_print("t_origins.shape={}, t_dirs.shape={}, midpoints.shape={}, mask.shape={}, t_min.shape={}, t_max.shape={}".format(
+        #     t_origins.shape,t_dirs.shape,midpoints.shape,mask.shape,t_min.shape,t_max.shape
+        # ))
+        # midpoints=midpoints[mask]
+        positions = t_origins + t_dirs * midpoints
         intervals = t_ends - t_starts
 
         density, feature = self.geometry_bg(positions) 
         rgb = self.texture_bg(feature, t_dirs)
 
-        weights = render_weight_from_density(t_starts, t_ends, density[...,None], ray_indices=ray_indices, n_rays=n_rays)
-        opacity = accumulate_along_rays(weights, ray_indices, values=None, n_rays=n_rays)
-        depth = accumulate_along_rays(weights, ray_indices, values=midpoints, n_rays=n_rays)
-        comp_rgb = accumulate_along_rays(weights, ray_indices, values=rgb, n_rays=n_rays)
+        weights, trans_, _  = render_weight_from_density(
+            t_starts[..., 0], t_ends[..., 0], 
+            density.view(-1), 
+            ray_indices=ray_indices, 
+            n_rays=n_rays)
+        opacity = accumulate_along_rays(weights, values=None, ray_indices=ray_indices, n_rays=n_rays)
+        depth = accumulate_along_rays(weights, values=midpoints, ray_indices=ray_indices, n_rays=n_rays)
+        comp_rgb = accumulate_along_rays(weights, values=rgb, ray_indices=ray_indices, n_rays=n_rays)
         comp_rgb = comp_rgb + self.background_color * (1.0 - opacity)       
 
         out = {
@@ -205,21 +239,51 @@ class NeuSModel(BaseModel):
     def forward_(self, rays):
         n_rays = rays.shape[0]
         rays_o, rays_d = rays[:, 0:3], rays[:, 3:6] # both (N_rays, 3)
+        
+        def alpha_fn(t_starts, t_ends, ray_indices):
+            ray_indices = ray_indices.long()
+            t_origins = rays_o[ray_indices]
+            t_dirs = rays_d[ray_indices]
+            positions = t_origins + t_dirs * (t_starts + t_ends)[..., None] / 2.
+            sdf = self.geometry.forward_level(positions)
+            inv_s = self.variance(torch.zeros([1, 3]))[:, :1].clip(1e-6, 1e6)
+            inv_s = inv_s.expand(sdf.shape[0], 1)
+            estimated_next_sdf = sdf[...,None] - self.render_step_size * 0.5
+            estimated_prev_sdf = sdf[...,None] + self.render_step_size * 0.5
+            prev_cdf = torch.sigmoid(estimated_prev_sdf * inv_s)
+            next_cdf = torch.sigmoid(estimated_next_sdf * inv_s)
+            p = prev_cdf - next_cdf
+            c = prev_cdf
+            alpha = ((p + 1e-5) / (c + 1e-5)).clip(0.0, 1.0)
+            return alpha.view(-1)
+
+        t_min, t_max, hits = ray_aabb_intersect(
+            rays_o=rays_o,
+            rays_d=rays_d,
+            aabbs=self.scene_aabb.unsqueeze(0),
+            near_plane=self.near_plane,
+            far_plane=self.far_plane,
+        )
+        t_min, t_max, hits = t_min.squeeze(), t_max.squeeze(), hits.squeeze()
 
         with torch.no_grad():
-            ray_indices, t_starts, t_ends = ray_marching(
+            ray_indices, t_starts, t_ends = self.occupancy_grid.sampling(
                 rays_o, rays_d,
-                scene_aabb=self.scene_aabb,
-                grid=self.occupancy_grid if self.config.grid_prune else None,
-                alpha_fn=None,
-                near_plane=None, far_plane=None,
+                alpha_fn=alpha_fn if self.prune_alpha else None,
+                near_plane=self.near_plane,
+                far_plane=self.far_plane,
+                t_min=t_min,
+                t_max=t_max,
                 render_step_size=self.render_step_size,
-                stratified=self.randomized,
+                stratified=self.randomized_fg,
                 cone_angle=0.0,
-                alpha_thre=0.0
+                alpha_thre=self.prune_alpha_threshold if self.prune_alpha else 0.0
             )
         
-        ray_indices = ray_indices.long()
+        ray_indices = ray_indices.flatten().long()
+        ray_indices, t_starts, t_ends=validate_empty_rays(ray_indices,t_starts,t_ends)
+        t_starts = t_starts.flatten()[..., None]
+        t_ends = t_ends.flatten()[..., None]
         t_origins = rays_o[ray_indices]
         t_dirs = rays_d[ray_indices]
         midpoints = (t_starts + t_ends) / 2.
@@ -231,15 +295,19 @@ class NeuSModel(BaseModel):
         else:
             sdf, sdf_grad, feature = self.geometry(positions, with_grad=True, with_feature=True)
         normal = F.normalize(sdf_grad, p=2, dim=-1)
-        alpha = self.get_alpha(sdf, normal, t_dirs, dists)[...,None]
+        alpha = self.get_alpha(sdf, normal, t_dirs, dists)
         rgb = self.texture(feature, t_dirs, normal)
 
-        weights = render_weight_from_alpha(alpha, ray_indices=ray_indices, n_rays=n_rays)
-        opacity = accumulate_along_rays(weights, ray_indices, values=None, n_rays=n_rays)
-        depth = accumulate_along_rays(weights, ray_indices, values=midpoints, n_rays=n_rays)
-        comp_rgb = accumulate_along_rays(weights, ray_indices, values=rgb, n_rays=n_rays)
+        weights, _ = render_weight_from_alpha(
+            alpha,
+            ray_indices=ray_indices,
+            n_rays=n_rays,
+        )
+        opacity = accumulate_along_rays(weights, values=None, ray_indices=ray_indices, n_rays=n_rays)
+        depth = accumulate_along_rays(weights, values=midpoints, ray_indices=ray_indices, n_rays=n_rays)
+        comp_rgb = accumulate_along_rays(weights, values=rgb, ray_indices=ray_indices, n_rays=n_rays)
 
-        comp_normal = accumulate_along_rays(weights, ray_indices, values=normal, n_rays=n_rays)
+        comp_normal = accumulate_along_rays(weights, values=normal, ray_indices=ray_indices, n_rays=n_rays)
         comp_normal = F.normalize(comp_normal, p=2, dim=-1)
 
         out = {

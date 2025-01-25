@@ -9,6 +9,12 @@ from torch.cuda.amp import custom_bwd, custom_fwd
 
 import tinycudann as tcnn
 
+def validate_empty_rays(ray_indices, t_start, t_end):
+    if ray_indices.nelement() == 0:
+        ray_indices = torch.LongTensor([0]).to(ray_indices)
+        t_start = torch.Tensor([0]).to(ray_indices)
+        t_end = torch.Tensor([0]).to(ray_indices)
+    return ray_indices, t_start, t_end
 
 def chunk_batch(func, chunk_size, move_to_cpu, *args, **kwargs):
     B = None
