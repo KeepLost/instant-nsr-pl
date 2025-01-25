@@ -1,3 +1,9 @@
+# Notice
+
+This branch tries to adpat to nerfacc v0.5.3, and solve several issues like [CUDA error](https://github.com/bennyguo/instant-nsr-pl/issues/73) caused by empty rays created only in validation phase, and [device problem](https://github.com/bennyguo/instant-nsr-pl/issues/82) happened in test phase. But this is still under development. It seems a big trouble when training with backgrounds...
+
+========================
+
 # Instant Neural Surface Reconstruction
 
 This repository contains a concise and extensible implementation of NeRF and NeuS for neural surface reconstruction based on Instant-NGP and the Pytorch-Lightning framework. **Training on a NeRF-Synthetic scene takes ~5min for NeRF and ~10min for NeuS on a single RTX3090.**
