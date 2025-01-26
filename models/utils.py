@@ -9,6 +9,20 @@ from torch.cuda.amp import custom_bwd, custom_fwd
 
 import tinycudann as tcnn
 
+from pytorch_lightning.utilities.rank_zero import rank_zero_only
+@rank_zero_only
+def rank_zero_print(print_str):
+    print(print_str)
+
+def validate_empty_rays(ray_indices, t_start, t_end):
+    if ray_indices.nelement() == 0:
+        # rank_zero_print("ray_indices.shape={}, t_start.shape={}, t_end.shape={}".format(
+        #     ray_indices.shape,t_start.shape,t_end.shape
+        # ))
+        ray_indices = torch.LongTensor([0]).to(ray_indices)
+        t_start = torch.Tensor([0]).to(ray_indices).view(1,1)
+        t_end = torch.Tensor([0]).to(ray_indices).view(1,1)
+    return ray_indices, t_start, t_end
 
 def chunk_batch(func, chunk_size, move_to_cpu, *args, **kwargs):
     B = None

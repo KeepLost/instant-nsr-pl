@@ -32,49 +32,53 @@ class NeuSSystem(BaseSystem):
         return self.model(batch['rays'])
     
     def preprocess_data(self, batch, stage):
+        all_images=self.dataset.all_images.cpu()
         if 'index' in batch: # validation / testing
-            index = batch['index']
+            index = batch['index'].cpu()
         else:
             if self.config.model.batch_image_sampling:
-                index = torch.randint(0, len(self.dataset.all_images), size=(self.train_num_rays,), device=self.dataset.all_images.device)
+                index = torch.randint(0, len(all_images), size=(self.train_num_rays,), device=all_images.device)
             else:
-                index = torch.randint(0, len(self.dataset.all_images), size=(1,), device=self.dataset.all_images.device)
+                index = torch.randint(0, len(all_images), size=(1,), device=all_images.device)
+        all_fg_masks=self.dataset.all_fg_masks.cpu()
+        all_c2w=self.dataset.all_c2w.cpu()
+        all_directions=self.dataset.directions.cpu()
         if stage in ['train']:
-            c2w = self.dataset.all_c2w[index]
+            c2w = all_c2w[index]
             x = torch.randint(
-                0, self.dataset.w, size=(self.train_num_rays,), device=self.dataset.all_images.device
+                0, self.dataset.w, size=(self.train_num_rays,), device=all_images.device
             )
             y = torch.randint(
-                0, self.dataset.h, size=(self.train_num_rays,), device=self.dataset.all_images.device
+                0, self.dataset.h, size=(self.train_num_rays,), device=all_images.device
             )
-            if self.dataset.directions.ndim == 3: # (H, W, 3)
-                directions = self.dataset.directions[y, x]
-            elif self.dataset.directions.ndim == 4: # (N, H, W, 3)
-                directions = self.dataset.directions[index, y, x]
+            if all_directions.ndim == 3: # (H, W, 3)
+                directions = all_directions[y, x]
+            elif all_directions.ndim == 4: # (N, H, W, 3)
+                directions = all_directions[index, y, x]
             rays_o, rays_d = get_rays(directions, c2w)
-            rgb = self.dataset.all_images[index, y, x].view(-1, self.dataset.all_images.shape[-1]).to(self.rank)
-            fg_mask = self.dataset.all_fg_masks[index, y, x].view(-1).to(self.rank)
+            rgb = all_images[index, y, x].view(-1, all_images.shape[-1]).to(self.device)
+            fg_mask = all_fg_masks[index, y, x].view(-1).to(self.device)
         else:
-            c2w = self.dataset.all_c2w[index][0]
-            if self.dataset.directions.ndim == 3: # (H, W, 3)
-                directions = self.dataset.directions
-            elif self.dataset.directions.ndim == 4: # (N, H, W, 3)
-                directions = self.dataset.directions[index][0] 
+            c2w = all_c2w[index][0]
+            if all_directions.ndim == 3: # (H, W, 3)
+                directions = all_directions
+            elif all_directions.ndim == 4: # (N, H, W, 3)
+                directions = all_directions[index][0] 
             rays_o, rays_d = get_rays(directions, c2w)
-            rgb = self.dataset.all_images[index].view(-1, self.dataset.all_images.shape[-1]).to(self.rank)
-            fg_mask = self.dataset.all_fg_masks[index].view(-1).to(self.rank)
+            rgb = all_images[index].view(-1, all_images.shape[-1]).to(self.device)
+            fg_mask = all_fg_masks[index].view(-1).to(self.device)
 
-        rays = torch.cat([rays_o, F.normalize(rays_d, p=2, dim=-1)], dim=-1)
+        rays = torch.cat([rays_o, F.normalize(rays_d, p=2, dim=-1)], dim=-1).to(device=self.device)
 
         if stage in ['train']:
             if self.config.model.background_color == 'white':
-                self.model.background_color = torch.ones((3,), dtype=torch.float32, device=self.rank)
+                self.model.background_color = torch.ones((3,), dtype=torch.float32, device=self.device)
             elif self.config.model.background_color == 'random':
-                self.model.background_color = torch.rand((3,), dtype=torch.float32, device=self.rank)
+                self.model.background_color = torch.rand((3,), dtype=torch.float32, device=self.device)
             else:
                 raise NotImplementedError
         else:
-            self.model.background_color = torch.ones((3,), dtype=torch.float32, device=self.rank)
+            self.model.background_color = torch.ones((3,), dtype=torch.float32, device=self.device)
         
         if self.dataset.apply_mask:
             rgb = rgb * fg_mask[...,None] + self.model.background_color * (1 - fg_mask[...,None])

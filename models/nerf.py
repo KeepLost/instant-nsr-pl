@@ -6,7 +6,7 @@ import torch.nn.functional as F
 
 import models
 from models.base import BaseModel
-from models.utils import chunk_batch
+from models.utils import chunk_batch,validate_empty_rays
 from systems.utils import update_module_step
 from nerfacc import ContractionType, OccupancyGrid, ray_marching, render_weight_from_density, accumulate_along_rays
 
@@ -93,6 +93,7 @@ class NeRFModel(BaseModel):
             )   
         
         ray_indices = ray_indices.long()
+        ray_indices, t_starts, t_ends = validate_empty_rays(ray_indices, t_starts, t_ends)
         t_origins = rays_o[ray_indices]
         t_dirs = rays_d[ray_indices]
         midpoints = (t_starts + t_ends) / 2.
